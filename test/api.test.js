@@ -303,3 +303,146 @@ test('order-audit for an unknown id returns 404', async () => {
   assert.equal(res.statusCode, 404);
   assert.equal(res.json().error, 'Not Found');
 });
+
+/* --------------------------- GET .../round-trip-plan ---------------------- */
+
+async function createMerge(payload) {
+  const created = await app.inject({
+    method: 'POST',
+    url: '/api/v1/merges',
+    payload,
+  });
+  return created.json();
+}
+
+test('round-trip-plan on a clean record returns replayed forward + rollback patches', async () => {
+  const base = {
+    replicas: 2,
+    servers: [{ host: 'a.internal' }, { host: 'b.internal' }],
+    features: { cache: true, tracing: false },
+  };
+  const record = await createMerge({
+    base,
+    patchA: [{ op: 'replace', path: '/replicas', value: 3 }],
+    patchB: [{ op: 'remove', path: '/servers/0' }, { op: 'add', path: '/features/x', value: 1 }],
+  });
+  assert.equal(record.status, 'clean');
+
+  const res = await app.inject({
+    method: 'GET',
+    url: `/api/v1/merges/${record.id}/round-trip-plan`,
+  });
+  assert.equal(res.statusCode, 200);
+  const body = res.json();
+  assert.equal(body.id, record.id);
+  assert.equal(body.status, 'clean');
+  assert.equal(body.createdAt, record.createdAt);
+  assert.deepEqual(body.base, base);
+  assert.deepEqual(body.merged, record.merged);
+
+  // Only add/remove/replace, and array ops are index-safe (remove descending,
+  // add ascending): replay forward reaches merged and rollback restores base.
+  for (const op of [...body.forward, ...body.rollback]) {
+    assert.ok(['add', 'remove', 'replace'].includes(op.op));
+  }
+  assert.deepEqual(body.forward, [
+    { op: 'add', path: '/features/x', value: 1 },
+    { op: 'replace', path: '/replicas', value: 3 },
+    { op: 'remove', path: '/servers/0' },
+  ]);
+  assert.deepEqual(body.rollback, [
+    { op: 'remove', path: '/features/x' },
+    { op: 'replace', path: '/replicas', value: 2 },
+    { op: 'add', path: '/servers/0', value: { host: 'a.internal' } },
+  ]);
+  assert.deepEqual(body.operationCount, {
+    forward: { add: 1, remove: 1, replace: 1, total: 3 },
+    rollback: { add: 1, remove: 1, replace: 1, total: 3 },
+  });
+});
+
+test('round-trip-plan handles arrays with LCS and escaped object keys', async () => {
+  const record = await createMerge({
+    base: { list: [1, 2, 3, 2], 'a/b': 1 },
+    patchA: [{ op: 'replace', path: '/list', value: [2, 3, 2, 9] }],
+    patchB: [{ op: 'replace', path: '/a~1b', value: 7 }],
+  });
+  assert.equal(record.status, 'clean');
+  const res = await app.inject({
+    method: 'GET',
+    url: `/api/v1/merges/${record.id}/round-trip-plan`,
+  });
+  assert.equal(res.statusCode, 200);
+  const body = res.json();
+  // Raw-key order "a/b" < "list". For the array, [2,3,2] is the LCS: base
+  // index 0 (1) is removed and 9 appended, the equal elements stay in place.
+  assert.deepEqual(body.forward, [
+    { op: 'replace', path: '/a~1b', value: 7 },
+    { op: 'remove', path: '/list/0' },
+    { op: 'add', path: '/list/3', value: 9 },
+  ]);
+});
+
+test('round-trip-plan emits element-level LCS ops for in-place array edits', async () => {
+  const record = await createMerge({
+    base: { list: [1, 2, 3, 4] },
+    patchA: [{ op: 'replace', path: '/list/1', value: 20 }],
+    patchB: [{ op: 'add', path: '/list/-', value: 5 }],
+  });
+  assert.equal(record.status, 'clean');
+  assert.deepEqual(record.merged.list, [1, 20, 3, 4, 5]);
+  const res = await app.inject({
+    method: 'GET',
+    url: `/api/v1/merges/${record.id}/round-trip-plan`,
+  });
+  assert.equal(res.statusCode, 200);
+  const body = res.json();
+  // Kept by LCS: 1,3,4. 2 -> 20 removed+inserted; 5 appended.
+  // removals descending, insertions ascending at final indices.
+  assert.deepEqual(body.forward, [
+    { op: 'remove', path: '/list/1' },
+    { op: 'add', path: '/list/1', value: 20 },
+    { op: 'add', path: '/list/4', value: 5 },
+  ]);
+  assert.deepEqual(body.rollback, [
+    { op: 'remove', path: '/list/4' },
+    { op: 'remove', path: '/list/1' },
+    { op: 'add', path: '/list/1', value: 2 },
+  ]);
+  assert.deepEqual(body.merged.list, [1, 20, 3, 4, 5]);
+});
+
+test('round-trip-plan is byte-for-byte identical on repeated queries', async () => {
+  const record = await createMerge(EXAMPLE_REQUEST);
+  const url = `/api/v1/merges/${record.id}/round-trip-plan`;
+  const first = await app.inject({ method: 'GET', url });
+  const second = await app.inject({ method: 'GET', url });
+  assert.equal(first.statusCode, 200);
+  assert.equal(second.statusCode, 200);
+  assert.equal(first.body, second.body);
+});
+
+test('round-trip-plan on a conflict record returns 409 and does not modify it', async () => {
+  const record = await createMerge(EXAMPLE_CONFLICT_REQUEST);
+  assert.equal(record.status, 'conflict');
+  const res = await app.inject({
+    method: 'GET',
+    url: `/api/v1/merges/${record.id}/round-trip-plan`,
+  });
+  assert.equal(res.statusCode, 409);
+  assert.equal(res.json().error, 'Conflict');
+  assert.match(res.json().message, /conflict/);
+  // the stored record is untouched
+  const fetched = await app.inject({ method: 'GET', url: `/api/v1/merges/${record.id}` });
+  assert.equal(fetched.json().status, 'conflict');
+  assert.equal(fetched.json().merged, null);
+});
+
+test('round-trip-plan for an unknown id returns 404', async () => {
+  const res = await app.inject({
+    method: 'GET',
+    url: '/api/v1/merges/no-such-record/round-trip-plan',
+  });
+  assert.equal(res.statusCode, 404);
+  assert.equal(res.json().error, 'Not Found');
+});

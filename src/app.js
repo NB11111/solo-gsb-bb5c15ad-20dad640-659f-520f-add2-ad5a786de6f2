@@ -3,6 +3,7 @@ import Fastify from 'fastify';
 import { mergePatches, PatchError } from './merge.js';
 import { auditOrdering } from './audit.js';
 import { previewResolution, DecisionError, DECISION_CODES } from './resolution.js';
+import { buildRoundTripPlan } from './roundtrip.js';
 import { MergeStore } from './store.js';
 import { EXAMPLE_REQUEST, EXAMPLE_CONFLICT_REQUEST } from './example.js';
 
@@ -63,6 +64,8 @@ export function buildApp(options = {}) {
   // Audit results are deterministic; cache per stored record so repeated
   // queries serialize byte-for-byte without re-running the replays.
   const audits = new WeakMap();
+  // Round-trip plans are likewise pure functions of the saved base/merged.
+  const plans = new WeakMap();
   const startedAt = Date.now();
 
   app.setNotFoundHandler((req, reply) => {
@@ -108,6 +111,8 @@ export function buildApp(options = {}) {
         'replay saved patches A→B and B→A under strict RFC 6902 ordering (commutative / divergent / failed)',
       'POST /api/v1/merges/:id/resolution-preview':
         'preview per-conflict winner decisions (A/B) on a conflict record without modifying it',
+      'GET /api/v1/merges/:id/round-trip-plan':
+        'deterministic RFC 6902 forward (base -> merged) and rollback (merged -> base) patches, replayed server-side',
       'DELETE /api/v1/merges/:id': 'delete one rehearsal',
     },
   }));
@@ -178,6 +183,45 @@ export function buildApp(options = {}) {
       id: record.id,
       createdAt: record.createdAt,
       ...result,
+    };
+  });
+
+  app.get('/api/v1/merges/:id/round-trip-plan', async (req, reply) => {
+    const record = store.get(req.params.id);
+    if (!record) {
+      return reply.code(404).send({
+        statusCode: 404,
+        error: 'Not Found',
+        message: `no rehearsal stored with id ${req.params.id}`,
+      });
+    }
+    if (record.status !== 'clean') {
+      // Only successfully merged records carry a merged document to plan for.
+      // The stored record is never modified.
+      return reply.code(409).send({
+        statusCode: 409,
+        error: 'Conflict',
+        message:
+          `rehearsal ${req.params.id} has status "${record.status}"; ` +
+          'round-trip plan requires a clean merge record',
+      });
+    }
+    let plan = plans.get(record);
+    if (!plan) {
+      // buildRoundTripPlan replays both patches server-side and throws if
+      // either replay fails to reach its expected document.
+      plan = buildRoundTripPlan(record.base, record.merged);
+      plans.set(record, plan);
+    }
+    return {
+      id: record.id,
+      createdAt: record.createdAt,
+      status: record.status,
+      base: record.base,
+      merged: record.merged,
+      forward: plan.forward,
+      rollback: plan.rollback,
+      operationCount: plan.operationCount,
     };
   });
 

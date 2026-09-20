@@ -56,6 +56,7 @@ npm ci && npm start
 | `GET` | `/api/v1/merges/:id` | 查询单条预演（含输入与结果） |
 | `GET` | `/api/v1/merges/:id/order-audit` | 对已保存输入按严格 RFC 6902 顺序重放 A→B 与 B→A，判定可交换性 |
 | `POST` | `/api/v1/merges/:id/resolution-preview` | 对冲突记录按冲突序号提交胜方决定（A/B），预览解决结果（不修改记录） |
+| `GET` | `/api/v1/merges/:id/round-trip-plan` | 为干净合并记录生成确定性 RFC 6902 forward（base→merged）/ rollback（merged→base）补丁，服务端重放校验后返回 |
 | `DELETE` | `/api/v1/merges/:id` | 删除单条预演（`204`） |
 
 ### `POST /api/v1/merges`
@@ -243,6 +244,80 @@ curl -s -X POST "http://localhost:3000/api/v1/merges/$id/resolution-preview" \
 # => 200, merged: { "mode": "readonly" }；记录本身仍为 conflict，可换其他决定重试
 ```
 
+### `GET /api/v1/merges/:id/round-trip-plan`（往返补丁计划）
+
+对一条**已保存且合并成功（`status: "clean"`）**的记录，根据其保存的 `base` 与 `merged`
+生成两组**仅含 `add` / `remove` / `replace`** 的确定性 RFC 6902 补丁：
+
+- `forward`：`base` → `merged`（执行即得到合并结果）；
+- `rollback`：`merged` → `base`（执行即把合并结果回滚回基准）。
+
+补丁是 `base`、`merged` 的**纯函数**，生成规则完全确定：
+
+- **对象**：键按**字典序**（UTF-16 码元顺序，与区域设置无关）处理，引用记号按 RFC 6901
+  转义（`~` → `~0`、`/` → `~1`）；仅存在于一侧的成员发 `add` / `remove`，两侧都有但不同的
+  标量叶子发 `replace`，容器递归比较。
+- **数组**：用深度相等元素的**最长公共子序列（LCS）**对齐——相等元素原地保留，其余基准元素
+  一律 `remove`、其余结果元素一律 `add`（相等元素内部不做逐下标深改）。
+- **下标安全的发射次序**：同一数组内删除按基准下标**降序**发出（先删高位，低位下标不漂移），
+  插入按**最终下标升序**发出（从左到右重建），因此每条操作的数组下标在**执行当下**始终有效。
+
+服务端在返回前会**实际重放两组补丁**做校验：只有 `forward` 应用于 `base` **恰好得到 `merged`**、
+且 `rollback` 应用于 `merged` **恰好恢复 `base`** 时才返回结果；任一校验失败按 `500` 处理
+（正常输入下不会发生）。响应同时给出每个方向各操作类型的操作数。
+
+#### 响应结构（`200`）
+
+```jsonc
+{
+  "id": "...",
+  "createdAt": "...",
+  "status": "clean",
+  "base":   { /* 保存时的基准文档 */ },
+  "merged": { /* 合并结果 */ },
+  "forward": [
+    { "op": "add",     "path": "/features/retries", "value": 3 },
+    { "op": "replace", "path": "/features/tracing", "value": true },
+    { "op": "replace", "path": "/replicas", "value": 3 },
+    { "op": "remove",  "path": "/servers/0" },
+    { "op": "add", "path": "/servers/0", "value": { "host": "a2.internal", "port": 8080 } },
+    { "op": "add", "path": "/servers/1", "value": { "host": "b2.internal", "port": 9090 } }
+  ],
+  "rollback": [
+    { "op": "remove",  "path": "/features/retries" },
+    { "op": "replace", "path": "/features/tracing", "value": false },
+    { "op": "replace", "path": "/replicas", "value": 2 },
+    { "op": "remove",  "path": "/servers/1" },
+    { "op": "remove",  "path": "/servers/0" },
+    { "op": "add", "path": "/servers/0", "value": { "host": "a.internal", "port": 8080 } }
+  ],
+  "operationCount": {
+    "forward":  { "add": 3, "remove": 1, "replace": 2, "total": 6 },
+    "rollback": { "add": 1, "remove": 3, "replace": 2, "total": 6 }
+  }
+}
+```
+
+可以看到：对象操作按字典序（`features` 在 `replicas` 之前，`replicas` 在 `servers` 之前，
+`features` 内部 `retries` 在 `tracing` 之前）；`servers` 先降序删除，再按最终下标升序插入——
+逐条按 RFC 6902 执行即可精确得到 `merged`。
+
+#### 状态码与确定性
+
+- **干净记录 → `200`**：返回上述计划。
+- **冲突记录（`status: "conflict"`）→ `409`**：冲突记录没有 `merged`，不生成计划，
+  且**不修改记录**；返回 `{ statusCode, error: "Conflict", message }`。
+- **记录不存在 → `404`**。
+- 计划按记录在服务端缓存：对**同一条记录重复请求**返回**逐字节一致**的响应（不重新重放）。
+- 文档根若整体改变（如标量↔容器），使用 `replace` 路径 `""`；`base` 与 `merged` 深度相等时
+  两组补丁均为空数组、操作数全为 `0`。
+
+示例：
+
+```bash
+curl -s http://localhost:3000/api/v1/merges/<id>/round-trip-plan | jq
+```
+
 ## 示例请求
 
 干净合并（也见 `examples/merge-request.json`，或 `GET /api/v1/example`）：
@@ -326,6 +401,7 @@ curl -s http://localhost:3000/api/v1/merges/<id>/order-audit | jq  # 顺序审�
 curl -s -X POST http://localhost:3000/api/v1/merges/<id>/resolution-preview \
   -H 'Content-Type: application/json' \
   -d @examples/resolution-preview-request.json | jq       # 冲突解决预览
+curl -s http://localhost:3000/api/v1/merges/<id>/round-trip-plan | jq  # forward / rollback 补丁
 curl -s -X DELETE http://localhost:3000/api/v1/merges/<id> # 删除记录
 ```
 
@@ -384,8 +460,11 @@ npm test
 覆盖：指针转义、索引漂移重定位、同缝隙 A/B 定序、去重规则、全部冲突类型、
 非法补丁（`422`）、schema 校验（`400`）、存储的增删查、健康检查，顺序审计的
 可交换 / 发散（RFC 6901 字典序最小差异）/ 失败（失败方、原始序号、失败前文档）判定与
-重复查询确定性，以及冲突解决预览的胜方保留 / 败方剔除、覆盖校验（`400`）、
-矛盾决定（`422`）、剩余冲突（`409`）、记录不变与重复请求确定性等。
+重复查询确定性，冲突解决预览的胜方保留 / 败方剔除、覆盖校验（`400`）、
+矛盾决定（`422`）、剩余冲突（`409`）、记录不变与重复请求确定性，以及往返补丁计划的
+对象字典序与 JSON Pointer 转义、数组 LCS 对齐（删除降序 / 插入升序）、根替换、
+前向与回滚重放校验、操作数统计、干净记录可用 / 冲突记录 `409` 且不改记录 / 未知 `404`
+与重复请求逐字节一致等。
 
 ## 项目结构
 
@@ -397,6 +476,7 @@ npm test
 │   ├── merge.js               # 合并引擎：规范化 → 补丁内解析 → 跨补丁冲突检测 → 应用
 │   ├── audit.js               # 顺序审计：严格 RFC 6902 顺序重放 A→B / B→A、失败捕获、字典序最小差异
 │   ├── resolution.js          # 冲突解决预览：胜方决定校验 → 剔除败方 → 复用合并引擎（纯函数，不写存储）
+│   ├── roundtrip.js           # 往返补丁：字典序对象 diff + 数组 LCS（删除降序/插入升序）→ RFC 6902 forward/rollback，服务端重放校验
 │   ├── store.js               # 内存存储（FIFO 淘汰）
 │   └── example.js             # 内置示例请求
 ├── test/                      # node:test 单元 + 集成测试
@@ -412,3 +492,6 @@ npm test
 - 单补丁内操作按基准坐标解释，不做补丁内顺序重放；同路径多操作按 last-wins 处理（见上）。
   若需要「补丁内逐条作用于上一条结果、下标随当前文档漂移」的严格 RFC 6902 语义，
   使用 `GET /api/v1/merges/:id/order-audit`；其结果按记录缓存，重复查询完全一致。
+- 往返补丁（`GET /api/v1/merges/:id/round-trip-plan`）由 `base` 与 `merged` 的确定性
+  diff 生成（仅 add/remove/replace；数组按 LCS 对齐、删除降序、插入升序），服务端重放
+  校验前向与回滚均成立后才返回，并按记录缓存；仅干净合并记录可用，冲突记录返回 `409`。
